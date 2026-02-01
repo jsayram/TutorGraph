@@ -569,3 +569,1095 @@ When you’re ready to restart this project, do these in order:
 ---
 
 **End of spec.**
+
+
+
+# USER WORKFLOW
+
+Here’s the **end-to-end workflow** for TutorGraph, in plain terms, from “first time user” to “daily use.”
+
+---
+
+## Workflow (what a user actually does)
+
+### 1) Join or create a space (Tenant / Org)
+
+* **Admin/Teacher** creates a new space like: “AP Biology — Period 3”
+* They **invite students** by email (or invite link)
+* Students accept and now they’re inside that space
+  *(This is how the app keeps different classes/groups separated.)*
+
+---
+
+### 2) Create a course
+
+* Admin creates a course inside the space, like:
+
+  * “Unit 1: Cells”
+  * “Chapter 4: Genetics”
+* Think of a course like a folder that holds learning material.
+
+---
+
+### 3) Add content (the “brain” of the course)
+
+Admin uploads course content:
+
+* paste notes
+* upload a markdown/text file
+* (later: PDF)
+
+The app then automatically:
+
+* breaks content into chunks
+* stores it
+* creates “search fingerprints” (embeddings)
+* marks the course as “ready”
+
+---
+
+### 4) Student uses “Ask” mode (Q&A with receipts)
+
+Student goes to **Ask**:
+
+* types a question like: “What’s the difference between mitosis and meiosis?”
+* the app searches the course content
+* picks the best sections (reranking)
+* answers
+* shows citations like: “Source: Doc 2, Chunk 7”
+
+Student can then:
+
+* click a citation to see the exact snippet
+* thumbs up/down the answer
+* mark if it felt grounded or not
+
+---
+
+### 5) Student uses “Quiz” mode (practice + grading)
+
+Student goes to **Quiz**:
+
+* clicks “Start Quiz”
+* the app chooses a difficulty level based on their recent scores
+* generates questions from the course content (with citations behind the scenes)
+* student answers
+* app grades + explains
+
+After finishing:
+
+* score is saved
+* weak topics are identified
+* mastery score updates
+
+---
+
+### 6) Adaptive difficulty kicks in automatically
+
+Next time they take a quiz:
+
+* if they’ve been doing well → harder questions
+* if they struggle → easier questions + more review-style questions
+
+So it evolves with the student.
+
+---
+
+### 7) Admin monitoring (optional but “real product”)
+
+Admin can:
+
+* see who joined
+* see what content is uploaded and indexed
+* view an **audit log** of actions (invites, uploads, role changes)
+* view basic performance summaries (optional)
+
+---
+
+## The “daily use” loop (simple version)
+
+1. Upload/refresh notes
+2. Ask questions while studying
+3. Take quiz
+4. Improve mastery
+5. Repeat
+
+---
+**UI flow diagram** (ASCII) or a **step-by-step demo script** you can follow in a screen recording.
+TutorGraph — Detailed UI + Working Architecture Flow (ASCII)
+============================================================
+
+Legend:
+  UI = screens/components user sees
+  API = FastAPI endpoints
+  SVC = internal service/module
+  DB = Postgres (pgvector)
+  OBJ = S3-like object storage (LocalStack S3 now, AWS S3 later)
+  EVT = Dynamo-like event stream (LocalStack DynamoDB now, AWS DynamoDB later)
+  LLM = model provider (Mock/Local now, Bedrock/Azure/OpenAI later)
+
+Global Request Pattern
+----------------------
+[React Web] -- Authorization: Bearer <JWT>
+           -- X-Tenant-Id: <tenant_id>
+           --> [FastAPI API]
+           --> (API verifies JWT + tenant membership + role gates)
+
+
+0) High-level Component Architecture (Local-first, AWS-shaped)
+--------------------------------------------------------------
++-------------------+         HTTPS          +---------------------------+
+|     User Browser  | <--------------------> |        React Web UI        |
++-------------------+                        +------------+--------------+
+                                                         |
+                                                         | HTTPS (JWT + X-Tenant-Id)
+                                                         v
+                                            +------------+--------------+
+                                            |         FastAPI API        |
+                                            |  - auth middleware         |
+                                            |  - tenant enforcement      |
+                                            |  - rate limiting           |
+                                            |  - structured logging      |
+                                            +------+----------+----------+
+                                                   |          |
+                                   SQL (pgvector)  |          | adapters (same interface)
+                                                   |          |
+                                                   v          v
+                                       +-----------+--+   +---+------------------+
+                                       | Postgres +   |   | Providers/Adapters   |
+                                       |  pgvector    |   |  StorageProvider     |
+                                       | (single source|   |  EventStore         |
+                                       |  of truth for |   |  LLMProvider        |
+                                       |  v1 core)     |   +---+-----------+-----+
+                                       +---------------+       |           |
+                                                               |           |
+                                                             OBJ         EVT
+                                                    (LocalStack S3) (LocalStack DDB)
+                                                    (AWS S3 later)  (AWS DDB later)
+
+LLM is also behind adapter:
+   LLMProvider -> Mock/Local now  |  Bedrock/Azure/OpenAI later
+
+
+1) UI Flow (Detailed) + the backend calls behind each click
+------------------------------------------------------------
+
+A) Login + Tenant/Course selection
+----------------------------------
++-------------------+        +-----------------------+
+|  [Landing/Login]  | -----> |  [Tenant Switcher UI] |
++-------------------+        +-----------+-----------+
+        |                               |
+        | (dev login issues JWT)        | GET /tenants
+        v                               v
++-------------------+        +-----------------------+
+|  JWT stored client|        | [Course Selector UI]  |
++-------------------+        +-----------+-----------+
+                                        |
+                                        | GET /courses (scoped by X-Tenant-Id)
+                                        v
+                               +-----------------------+
+                               |     [Dashboard]       |
+                               | mastery + recents     |
+                               +-----------+-----------+
+                                           |
+                                           +--> Nav: Ask | Quiz | Content | Admin
+
+
+B) Content Upload Flow (Admin) — “Ingest pipeline”
+--------------------------------------------------
+UI:
+[Content Page] -> Upload -> See status -> (Optional) Reindex
+
+Under the hood:
+
+(1) Upload document
+[React Content UI]
+    |
+    | POST /courses/{course_id}/documents
+    | body: {title, text/markdown}  OR  (file upload)
+    v
+[FastAPI API]
+    |
+    | SVC: DocumentService.create_document()
+    |   - writes Documents row (status=processing)
+    |   - (optional) stores raw doc in OBJ via StorageProvider
+    |   - emits "document_uploaded" event to EVT
+    v
+[DB: documents]
+
+(2) Chunk + embed + index
+[FastAPI API] (sync for MVP OR background job later)
+    |
+    | SVC: IngestService.index_document(doc_id)
+    |   - normalize text
+    |   - chunk(text, size ~800 chars, overlap ~120)
+    |   - embed chunks via LLMProvider.embed()  (mock/local now)
+    |   - store chunks + embeddings in DB (pgvector)
+    |   - update document status=indexed
+    |   - emit "document_indexed" event
+    v
+[DB: chunks (embedding vector), documents(status=indexed)]
+
+(3) UI refresh
+[React Content UI]
+    |
+    | GET /courses/{course_id}/documents
+    v
+[FastAPI API] -> [DB]
+    |
+    v
+[Shows list: processing / indexed / failed]
+
+(4) Reindex (Admin)
+[React Content UI] -> "Reindex"
+    |
+    | POST /documents/{doc_id}/reindex
+    v
+[FastAPI API] -> IngestService re-runs steps above
+
+
+C) Ask Flow (Learner) — “RAG + reranking + citations”
+-----------------------------------------------------
+UI:
+[Ask Page] -> Ask question -> See answer + citations -> Provide feedback
+
+Under the hood:
+
+(1) Ask question
+[React Ask UI]
+    |
+    | POST /courses/{course_id}/query
+    | body: {question, top_n=40, top_k=10, debug?}
+    v
+[FastAPI API]
+    |
+    | Middleware:
+    |   - verify JWT
+    |   - enforce tenant membership (X-Tenant-Id)
+    |   - rate limit (per user/IP)
+    |   - attach request_id to logs
+    |
+    | SVC: QueryService.answer_question()
+    |   a) store question
+    |   b) embed(question) via LLMProvider.embed()
+    |   c) vector search in pgvector: top_n chunks within course_id + tenant_id
+    |   d) rerank: hybrid score (vector sim + keyword overlap/BM25-ish)
+    |   e) select top_k chunks as context
+    |   f) generate answer via LLMProvider.generate()
+    |      - prompt forces "answer only from context"
+    |   g) build citations (doc_id, chunk_id, snippet, score)
+    |   h) store answer + citations
+    |   i) emit "question_answered" event with retrieval stats
+    v
+[DB: questions, answers, citations]   +   [EVT: EventStream optional]
+
+(2) Render answer + citations
+[React Ask UI]
+    |
+    | Response:
+    |  - answer text
+    |  - citations[] (snippets + doc/chunk refs)
+    |  - retrieval_stats (top_n/top_k/latency) when debug enabled
+    v
+[UI shows Answer + expandable Citations Drawer]
+
+(3) Feedback loop
+[React Ask UI] -> thumbs up/down + grounded?
+    |
+    | POST /answers/{answer_id}/feedback
+    v
+[FastAPI API] -> FeedbackService.store_feedback()
+    |
+    +--> [DB: feedback]  +--> emit "answer_feedback" event
+
+
+D) Quiz Flow (Learner) — “Adaptive difficulty loop”
+---------------------------------------------------
+UI:
+[Quiz Page] -> Start -> Answer -> Submit -> Results -> Next quiz auto-adjusts
+
+Under the hood:
+
+(1) Start quiz
+[React Quiz UI]
+    |
+    | POST /courses/{course_id}/quizzes/generate
+    v
+[FastAPI API]
+    |
+    | SVC: QuizService.generate_quiz()
+    |   a) read mastery(user_id, course_id)
+    |   b) choose difficulty tier (1..4) based on mastery thresholds
+    |   c) pick source chunks:
+    |      - can reuse retrieval to sample relevant chunks
+    |   d) generate questions via LLMProvider.generate()
+    |      - "generate questions from these chunks"
+    |      - store questions + (optional) citations per question
+    |   e) store quiz record (difficulty_tier)
+    |   f) emit "quiz_generated" event
+    v
+[DB: quizzes, quiz_questions]
+
+(2) Take quiz
+[React Quiz UI] (client-side only until submit)
+
+(3) Submit attempt + grading
+[React Quiz UI] -> Submit
+    |
+    | POST /quizzes/{quiz_id}/attempts
+    | body: {answers[]}
+    v
+[FastAPI API]
+    |
+    | SVC: QuizService.grade_attempt()
+    |   a) compute score (MCQ exact match; short answer rubric later)
+    |   b) generate explanations (optional) with citations
+    |   c) store attempt + score
+    |   d) update mastery:
+    |      mastery_score = weighted avg of last N attempts
+    |   e) emit "quiz_submitted" + "mastery_updated"
+    v
+[DB: quiz_attempts, mastery]  +  [EVT optional]
+
+(4) Show results
+[React Quiz UI] -> GET /courses/{course_id}/performance
+    |
+    v
+[FastAPI API] -> [DB] -> mastery meter + recent attempts
+
+
+2) Internal Modules (what the repo is “really” made of)
+-------------------------------------------------------
+API Layer:
+  - auth middleware (JWT verify)
+  - tenant middleware (X-Tenant-Id -> membership check)
+  - rate limiter
+  - request_id + structured logs
+
+Services:
+  - TenantService (tenants/memberships/roles/invites)
+  - CourseService (courses)
+  - DocumentService (documents + status)
+  - IngestService (chunking + embeddings + chunk storage)
+  - QueryService (RAG + rerank + citations)
+  - QuizService (generate + grade + mastery)
+  - Audit/EventService (audit_log rows + optional EVT stream)
+
+Shared “providers” (adapters you can swap later):
+  - LLMProvider      : Mock/Local  <-> Bedrock/Azure/OpenAI
+  - StorageProvider  : LocalStack S3 <-> AWS S3
+  - EventStore       : LocalStack DDB <-> AWS DynamoDB
+  - VectorStore      : Postgres pgvector <-> RDS pgvector
+
+
+3) “AWS-shaped” mapping (so the optional deploy is not painful)
+---------------------------------------------------------------
+Local Target A (Docker Compose):
+  React Web  -> container
+  FastAPI    -> container
+  Postgres   -> container + pgvector
+  LocalStack -> S3 + DynamoDB (optional)
+  LLM        -> mocked/local
+
+AWS Target B (Terraform module later):
+  React Web  -> S3 + CloudFront
+  FastAPI    -> ECS Fargate + ALB
+  Postgres   -> RDS Postgres + pgvector
+  Events     -> DynamoDB
+  Logs       -> CloudWatch
+  Secrets    -> SSM / Secrets Manager
+
+Key point: same API + same services; only provider endpoints change.
+
+
+## USER WORKFLOW 
+TutorGraph — UI Workflow Flowchart (ASCII)
+==========================================
+
+                         +------------------+
+                         |     Landing      |
+                         +------------------+
+                                  |
+                                  v
+                         +------------------+
+                         |      Login       |
+                         | (Admin / Learner)|
+                         +------------------+
+                                  |
+                                  v
+                         +------------------+
+                         |  Tenant Switch   |
+                         | (Org / Class)    |
+                         +------------------+
+                                  |
+                                  v
+                         +------------------+
+                         |  Course Select   |
+                         +------------------+
+                                  |
+                                  v
+                         +------------------+
+                         |    Dashboard     |
+                         | mastery + recents|
+                         +----+---------+---+
+                              |         |
+               Learner (Student)       Admin (Teacher/Admin)
+                              |         |
+                +-------------+         +------------------+
+                |                                |
+                v                                v
+        +------------------+            +------------------+
+        |       Ask        |            |      Content     |
+        | Q -> Answer      |            | Upload / Paste   |
+        | + Citations      |            | Docs Status      |
+        +--------+---------+            +--------+---------+
+                 |                               |
+                 v                               v
+        +------------------+            +------------------+
+        |  Open Citations  |            |  Reindex (opt.)  |
+        |  View Snippets   |            +--------+---------+
+        +--------+---------+                     |
+                 |                               v
+                 v                       +------------------+
+        +------------------+             |     Dashboard     |
+        | Feedback         |             +------------------+
+        | Helpful/Grounded |
+        +--------+---------+
+                 |
+                 v
+        +------------------+
+        |     Dashboard    |
+        +--------+---------+
+                 |
+                 v
+        +------------------+
+        |       Quiz       |
+        | Start Quiz       |
+        +--------+---------+
+                 |
+                 v
+        +------------------+
+        |   Take Quiz      |
+        | Answer + Submit  |
+        +--------+---------+
+                 |
+                 v
+        +------------------+
+        |   Quiz Results   |
+        | Score + Weakness |
+        | Mastery Updates  |
+        +--------+---------+
+                 |
+                 v
+        +------------------+
+        | Next Quiz Tier   |
+        | auto adjusts     |
+        +--------+---------+
+                 |
+                 v
+             (back to Quiz)
+
+
+Admin extras (from Dashboard)
+-----------------------------
+                 +------------------+
+                 |      Admin       |
+                 | Members/Invites  |
+                 | Roles/Audit Log  |
+                 +--------+---------+
+                          |
+                          v
+                     +----------+
+                     |Dashboard |
+                     +----------+
+
+
+------------------------
+------------------------
+# TutorGraph — FULL UI STATE FLOW (ALL STATES) (ASCII)
+====================================================
+
+Legend:
+  [STATE]          = screen/page/state
+  (global)         = can happen anywhere
+  -->              = navigation/action
+  ---error/alt---> = alternate path
+  (Admin only) / (Learner) / (All)
+
+--------------------------------------------------------------------------------
+0) GLOBAL STATES (can occur from ANY screen)
+--------------------------------------------------------------------------------
+(global) [Loading Spinner]  -> returns to prior state when done
+(global) [API Error Banner] -> user can Retry -> prior state
+(global) [Offline / Network Error] -> Retry -> prior state
+(global) [Rate Limited (429)] -> Wait/Retry -> prior state
+(global) [Session Expired] -> redirects to [Login]
+(global) [Forbidden (403)] -> [No Access]
+(global) [Not Found (404)] -> [Not Found]
+(global) [Maintenance Mode] -> [Maintenance Page]
+
+[No Access]
+  -> Switch Tenant
+  -> Back to [Tenant Switcher]
+
+[Not Found]
+  -> Back to [Dashboard] (if possible) OR [Tenant Switcher]
+
+[Maintenance Page]
+  -> Retry -> [Landing] or last known state
+
+
+--------------------------------------------------------------------------------
+1) ENTRY / AUTH / ACCOUNT STATES
+--------------------------------------------------------------------------------
+[Landing]
+  -> Sign In
+  -> (optional) Sign Up (if enabled)
+  -> (optional) Accept Invite Link (if token present)
+      |
+      v
+[Login] (All)
+  -> Success -> [Tenant Switcher]
+  ---error---> [Login Error] -> Retry -> [Login]
+
+[Login Error]
+  -> Retry -> [Login]
+  -> Back -> [Landing]
+
+[Invite Link Opened] (token route)
+  -> If not logged in -> [Login] -> returns to [Invite Acceptance]
+  -> If logged in -> [Invite Acceptance]
+
+[Invite Acceptance]
+  -> Accept Invite -> [Invite Accepted] -> [Tenant Switcher]
+  ---expired---> [Invite Expired]
+  ---invalid---> [Invite Invalid]
+  ---already member---> [Already Joined] -> [Tenant Switcher]
+
+[Invite Expired]
+  -> Back -> [Landing] / [Login]
+  -> (Admin must resend invite)
+
+[Invite Invalid]
+  -> Back -> [Landing] / [Login]
+
+[Already Joined]
+  -> Continue -> [Tenant Switcher]
+
+[Profile] (All)  (global via top bar)
+  -> Sign Out -> [Landing]
+  -> (optional) Account Settings -> [Account Settings]
+
+[Account Settings] (All)
+  -> Back -> prior page
+
+
+--------------------------------------------------------------------------------
+2) TENANT (ORG) STATES
+--------------------------------------------------------------------------------
+[Tenant Switcher] (All)
+  -> Select Tenant -> [Course Selector]
+  -> Create Tenant (Admin/Owner) -> [Create Tenant]
+  ---no tenants yet---> [Empty Tenants State]
+
+[Empty Tenants State]
+  -> Create Tenant -> [Create Tenant]
+  -> Sign Out -> [Landing]
+
+[Create Tenant] (Admin/Owner)
+  -> Create -> [Tenant Created] -> [Course Selector]
+  ---error---> [Create Tenant Error] -> Retry -> [Create Tenant]
+
+[Create Tenant Error]
+  -> Retry -> [Create Tenant]
+  -> Back -> [Tenant Switcher]
+
+[Tenant Created]
+  -> Continue -> [Course Selector]
+
+
+--------------------------------------------------------------------------------
+3) COURSE STATES
+--------------------------------------------------------------------------------
+[Course Selector] (All)
+  -> Select Course -> [Dashboard]
+  -> Create Course (Admin) -> [Create Course]
+  ---no courses yet---> [Empty Courses State]
+
+[Empty Courses State]
+  -> Create Course (Admin) -> [Create Course]
+  -> Switch Tenant -> [Tenant Switcher]
+
+[Create Course] (Admin)
+  -> Create -> [Course Created] -> [Dashboard]
+  ---error---> [Create Course Error] -> Retry -> [Create Course]
+
+[Create Course Error]
+  -> Retry -> [Create Course]
+  -> Back -> [Course Selector]
+
+[Course Created]
+  -> Continue -> [Dashboard]
+
+
+--------------------------------------------------------------------------------
+4) DASHBOARD STATES (HOME)
+--------------------------------------------------------------------------------
+[Dashboard] (All)
+  -> Nav: Ask (Learner/Admin) -> [Ask (Idle)]
+  -> Nav: Quiz (Learner/Admin) -> [Quiz Home]
+  -> Nav: Content (Admin) -> [Content Home]
+  -> Nav: Admin (Admin/Owner) -> [Admin Home]
+  -> Switch Tenant (top bar) -> [Tenant Switcher]
+  -> Switch Course (top bar) -> [Course Selector]
+
+  ---if course has NO content--->
+      [Empty Course Content State]
+         -> (Admin) Go Upload -> [Content Home]
+         -> (Learner) View Message -> back to [Dashboard]
+
+[Empty Course Content State]
+  -> (Admin) Upload Content -> [Content Home]
+  -> Switch Course -> [Course Selector]
+
+
+--------------------------------------------------------------------------------
+5) CONTENT STATES (ADMIN)
+--------------------------------------------------------------------------------
+[Content Home] (Admin)
+  -> Upload/Paste -> [Upload Form]
+  -> View Docs List -> [Documents List]
+  -> Reindex Doc -> [Reindex Confirm] -> [Reindexing]
+  -> Delete/Archive Doc (optional) -> [Delete Confirm] -> [Doc Deleted]
+  -> Back -> [Dashboard]
+
+[Upload Form] (Admin)
+  -> Submit Upload -> [Uploading]
+  -> Cancel -> [Content Home]
+
+[Uploading]
+  -> Success -> [Indexing]
+  ---error---> [Upload Failed]
+
+[Upload Failed]
+  -> Retry -> [Uploading]
+  -> Back -> [Upload Form]
+
+[Indexing]
+  -> Success -> [Indexed Success]
+  ---error---> [Indexing Failed]
+
+[Indexing Failed]
+  -> Retry Index -> [Indexing]
+  -> Back -> [Documents List]
+
+[Indexed Success]
+  -> View Docs -> [Documents List]
+  -> Upload Another -> [Upload Form]
+  -> Back -> [Content Home]
+
+[Documents List] (Admin)
+  -> View Doc Details -> [Doc Detail]
+  -> Reindex -> [Reindex Confirm]
+  -> Back -> [Content Home]
+
+[Doc Detail] (Admin)
+  -> Back -> [Documents List]
+
+[Reindex Confirm]
+  -> Confirm -> [Reindexing]
+  -> Cancel -> [Documents List]
+
+[Reindexing]
+  -> Success -> [Indexed Success]
+  ---error---> [Indexing Failed]
+
+[Delete Confirm] (optional)
+  -> Confirm -> [Doc Deleted]
+  -> Cancel -> [Documents List]
+
+[Doc Deleted] (optional)
+  -> Back -> [Documents List]
+
+
+--------------------------------------------------------------------------------
+6) ASK (Q&A) STATES (LEARNER + ADMIN)
+--------------------------------------------------------------------------------
+[Ask (Idle)] (Learner/Admin)
+  -> Type Question -> Submit -> [Answer Generating]
+  -> Back -> [Dashboard]
+
+[Answer Generating]
+  -> Success -> [Answer Shown]
+  ---no relevant content---> [No Answer Found]
+  ---timeout/error---> [Answer Failed]
+
+[Answer Shown]
+  -> Expand Citations -> [Citations Expanded]
+  -> Submit Feedback -> [Feedback Submitted]
+  -> Ask Another -> [Ask (Idle)]
+  -> Back -> [Dashboard]
+
+[Citations Expanded]
+  -> Open Citation -> [Citation Detail Drawer]
+  -> Collapse -> [Answer Shown]
+
+[Citation Detail Drawer]
+  -> Close -> [Citations Expanded]
+
+[Feedback Submitted]
+  -> Back to Answer -> [Answer Shown]
+
+[No Answer Found]
+  -> Suggest upload more content (message)
+  -> Ask Another -> [Ask (Idle)]
+  -> Back -> [Dashboard]
+
+[Answer Failed]
+  -> Retry -> [Answer Generating]
+  -> Back -> [Ask (Idle)]
+
+
+--------------------------------------------------------------------------------
+7) QUIZ STATES (LEARNER + ADMIN)
+--------------------------------------------------------------------------------
+[Quiz Home] (Learner/Admin)
+  -> Start Quiz -> [Quiz Generating]
+  -> View Past Attempts -> [Attempts List]
+  -> Back -> [Dashboard]
+
+  ---if no content indexed--->
+      [Quiz Unavailable (No Content)]
+         -> Back -> [Dashboard]
+         -> (Admin) Upload Content -> [Content Home]
+
+[Quiz Unavailable (No Content)]
+  -> Back -> [Dashboard]
+  -> (Admin) Upload -> [Content Home]
+
+[Quiz Generating]
+  -> Success -> [Quiz Taking]
+  ---error---> [Quiz Generate Failed]
+
+[Quiz Generate Failed]
+  -> Retry -> [Quiz Generating]
+  -> Back -> [Quiz Home]
+
+[Quiz Taking]
+  -> Submit -> [Submit Confirm] (optional) -> [Grading]
+  -> Cancel -> [Quiz Home] (optional)
+
+[Submit Confirm] (optional)
+  -> Confirm -> [Grading]
+  -> Cancel -> [Quiz Taking]
+
+[Grading]
+  -> Success -> [Quiz Results]
+  ---error---> [Grading Failed]
+
+[Grading Failed]
+  -> Retry -> [Grading]
+  -> Back -> [Quiz Home]
+
+[Quiz Results]
+  -> Show Score + Explanations + Weak Topics + Updated Mastery
+  -> Take Another Quiz -> [Quiz Home] (difficulty auto-adjusted)
+  -> Back -> [Dashboard]
+
+[Attempts List]
+  -> Open Attempt -> [Attempt Detail]
+  -> Back -> [Quiz Home]
+
+[Attempt Detail]
+  -> Back -> [Attempts List]
+
+
+--------------------------------------------------------------------------------
+8) ADMIN PANEL STATES (OWNER/ADMIN)
+--------------------------------------------------------------------------------
+[Admin Home] (Owner/Admin)
+  -> Members -> [Members List]
+  -> Invites -> [Invites List]
+  -> Send Invite -> [Invite Form]
+  -> SSO Settings -> [SSO Settings] (config UI in v1)
+  -> Audit Log -> [Audit Log Viewer]
+  -> Back -> [Dashboard]
+
+[Members List]
+  -> Change Role -> [Role Update] -> [Role Updated]
+  -> Remove Member (optional) -> [Remove Confirm] -> [Member Removed]
+  -> Back -> [Admin Home]
+
+[Role Update]
+  -> Save -> [Role Updated]
+  ---error---> [Role Update Failed]
+
+[Role Updated]
+  -> Back -> [Members List]
+
+[Role Update Failed]
+  -> Retry -> [Role Update]
+  -> Back -> [Members List]
+
+[Invite Form]
+  -> Send -> [Invite Sending] -> [Invite Sent]
+  ---error---> [Invite Failed]
+  -> Back -> [Admin Home]
+
+[Invite Sending]
+  -> Success -> [Invite Sent]
+  ---error---> [Invite Failed]
+
+[Invite Sent]
+  -> View Invites -> [Invites List]
+  -> Copy Invite Link (local demo)
+  -> Back -> [Admin Home]
+
+[Invite Failed]
+  -> Retry -> [Invite Sending]
+  -> Back -> [Invite Form]
+
+[Invites List]
+  -> View Invite -> [Invite Detail]
+  -> Resend (optional) -> [Invite Sending]
+  -> Revoke (optional) -> [Revoke Confirm] -> [Invite Revoked]
+  -> Back -> [Admin Home]
+
+[Invite Detail]
+  -> Back -> [Invites List]
+
+[Invite Revoked] (optional)
+  -> Back -> [Invites List]
+
+[SSO Settings] (v1 config only)
+  -> Save Config -> [SSO Saved]
+  ---error---> [SSO Save Failed]
+  -> Back -> [Admin Home]
+
+[SSO Saved]
+  -> Back -> [SSO Settings]
+
+[SSO Save Failed]
+  -> Retry -> [SSO Settings]
+  -> Back -> [Admin Home]
+
+[Audit Log Viewer]
+  -> Filter/Search -> stays here
+  -> Back -> [Admin Home]
+
+
+--------------------------------------------------------------------------------
+9) NAVIGATION SUMMARY (what’s always available)
+--------------------------------------------------------------------------------
+Top Bar (All, except unauth):
+  - Tenant Switcher
+  - Course Selector
+  - Profile (Sign out)
+
+Left Nav (role-gated):
+  - Dashboard (All)
+  - Ask (All in tenant)
+  - Quiz (All in tenant)
+  - Content (Admin only)
+  - Admin (Owner/Admin only)
+
+
+-----
+
+------
+
+
+# TutorGraph — Background Job States (ASCII)
+==========================================
+
+Goal:
+  Make long-running work (indexing, quiz gen, etc.) resilient + observable.
+  UI shows status, jobs can retry, failures are inspectable.
+
+Legend:
+  [JOB STATE]      = background job status
+  ->              = normal transition
+  ---error--->    = failure transition
+  (UI)            = what the user sees
+
+Core Background Job Types
+-------------------------
+  - DocumentIndexJob     (chunk + embed + store vectors)
+  - ReindexJob           (rebuild vectors for a doc)
+  - QuizGenerateJob      (generate quiz questions)
+  - QuizGradeJob         (grade + store results)  (optional async)
+  - EvalRunJob           (offline eval harness)   (optional)
+  - CleanupJob           (delete doc + cascade)   (optional)
+
+--------------------------------------------------------------------------------
+1) Document Indexing Job State Machine
+--------------------------------------------------------------------------------
+
+(UI action) Admin uploads doc or clicks "Reindex"
+     |
+     v
+[CREATED]
+  - Job record created with (tenant_id, course_id, doc_id)
+  - document.status = "processing"
+  |
+  v
+[QUEUED]
+  - job is waiting for a worker
+  - (UI) "Queued" badge in documents list
+  |
+  v
+[CLAIMED]
+  - a worker locks the job (lease/heartbeat begins)
+  - (UI) still shows "Processing"
+  |
+  v
+[RUNNING:CHUNKING]
+  - split text into chunks
+  - (UI) "Indexing: chunking..."
+  |
+  v
+[RUNNING:EMBEDDING]
+  - generate embeddings (batched)
+  - (UI) "Indexing: embedding..."
+  |
+  v
+[RUNNING:UPDATING_INDEX]
+  - write chunks + vectors to pgvector
+  - (UI) "Indexing: saving..."
+  |
+  v
+[SUCCEEDED]
+  - document.status = "indexed"
+  - job.completed_at set
+  - (UI) "Indexed" badge + timestamp
+  |
+  v
+[ARCHIVED]
+  - optional: job moved out of hot table / compacted
+
+
+Failure + retry path:
+---------------------
+[RUNNING:*]
+  ---error--->
+[FAILED]
+  - store: error_code, error_message, stack trace ref, attempt_count
+  - document.status = "failed"
+  - (UI) "Failed" badge + "Retry" button
+  |
+  +--> if retryable AND attempt_count < max:
+          |
+          v
+        [RETRY_SCHEDULED]
+          - next_run_at set (exponential backoff: 1m, 5m, 15m, 1h...)
+          - (UI) "Retry scheduled"
+          |
+          v
+        [QUEUED]  (when next_run_at arrives)
+  |
+  +--> else:
+        [DEAD_LETTERED]
+          - job will not retry automatically
+          - requires manual retry from UI/admin
+          - (UI) "Needs attention" + "View error"
+
+
+Timeout / worker crash path:
+----------------------------
+[CLAIMED] or [RUNNING:*]
+  ---heartbeat missing / lease expired--->
+[STALLED]
+  - (UI) "Stalled" badge (optional)
+  |
+  v
+[RETRY_SCHEDULED] -> [QUEUED]  (picked up by another worker)
+
+Cancellation path:
+------------------
+(UI) Admin clicks "Cancel indexing" (optional)
+  -> [CANCEL_REQUESTED]
+  -> worker sees flag
+  -> [CANCELLED]
+     - document.status = "cancelled" (or revert to previous state)
+     - (UI) "Cancelled"
+
+
+--------------------------------------------------------------------------------
+2) Quiz Generation Job State Machine (similar, smaller)
+--------------------------------------------------------------------------------
+
+(UI) Learner clicks "Start Quiz"
+     |
+     v
+[CREATED] -> [QUEUED] -> [CLAIMED] -> [RUNNING:GENERATING] -> [SUCCEEDED]
+   |                                                   |
+   ---error--------------------------------------------->
+                [FAILED] -> [RETRY_SCHEDULED] -> [QUEUED]
+                         -> [DEAD_LETTERED] (manual retry)
+
+(UI states)
+  - Queued: "Preparing your quiz..."
+  - Running: "Generating questions..."
+  - Failed: "Couldn’t generate quiz. Retry."
+
+
+--------------------------------------------------------------------------------
+3) Rerank / Query Jobs (usually NOT async, but can be)
+--------------------------------------------------------------------------------
+Most RAG queries stay synchronous for UX.
+If you async them, states look like:
+
+(UI) Ask question
+  -> [REQUEST_ACCEPTED] (202 + job_id)
+  -> [QUEUED] -> [RUNNING:RETRIEVE] -> [RUNNING:RERANK] -> [RUNNING:ANSWER]
+  -> [SUCCEEDED] (answer available)
+  -> [FAILED]/[RETRY_SCHEDULED]/[DEAD_LETTERED]
+
+(UI) polling states
+  - "Searching your course..."
+  - "Checking best sources..."
+  - "Writing answer..."
+
+
+--------------------------------------------------------------------------------
+4) How the UI should reflect job states (simple mapping)
+--------------------------------------------------------------------------------
+
+Documents list badge:
+  QUEUED            -> "Queued"
+  RUNNING:*         -> "Indexing"
+  SUCCEEDED         -> "Indexed"
+  FAILED            -> "Failed" + Retry button
+  RETRY_SCHEDULED   -> "Retry scheduled"
+  STALLED           -> "Stalled"
+  DEAD_LETTERED     -> "Needs attention"
+  CANCELLED         -> "Cancelled"
+
+Doc detail panel shows:
+  - status
+  - last updated
+  - attempt_count
+  - last error (if any)
+  - next retry time (if scheduled)
+  - actions: Retry / Cancel / Reindex
+
+
+--------------------------------------------------------------------------------
+5) Minimal implementation strategy (Local-first)
+--------------------------------------------------------------------------------
+Option A (simplest): Postgres-backed job queue
+  - jobs table with status + next_run_at
+  - worker process polls: WHERE status in (QUEUED, RETRY_SCHEDULED and due)
+  - claim with UPDATE ... WHERE status=QUEUED RETURNING *
+  - heartbeat column updated every N seconds
+  - stalled detection: now - heartbeat > threshold
+
+Option B (AWS-shaped later):
+  - SQS for queue + ECS worker
+  - DynamoDB for job status OR Postgres jobs table still fine
+  - CloudWatch for logs/metrics
+
+Both keep the same state model above.
+
+# ----------------------------
